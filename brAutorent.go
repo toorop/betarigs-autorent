@@ -2,12 +2,12 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"github.com/Toorop/go-betarigs"
 	"github.com/Toorop/go-coinbase"
 	"github.com/codegangsta/cli"
 	"log"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,6 +34,11 @@ type Keyring struct {
 	cbApiKey    string
 	cbApiSecret string
 	brApiKey    string
+}
+
+type failure struct {
+	Rig *betarigs.Rig
+	Err error
 }
 
 // Load loads keyring from text file
@@ -183,10 +188,10 @@ L:
 }
 
 // Rentrig rents the rig "rig"
-func rentRig(rig betarigs.Rig, duration int, pool *betarigs.Pool, chanReply chan bool) {
+func rentRig(rig betarigs.Rig, duration int, pool *betarigs.Pool, chanFailure chan failure, chanSuccess chan betarigs.RentalResponse, chanDryRun chan bool) {
 	if dryrun {
-		out("I'm running in dryrun, i will not rent rig", rig.Id)
-		chanReply <- true
+		out("I'm running in dry run mode, i will not rent rig", rig.Id)
+		chanDryRun <- true
 		return
 	}
 	// debug
@@ -194,39 +199,14 @@ func rentRig(rig betarigs.Rig, duration int, pool *betarigs.Pool, chanReply chan
 
 	resp, err := Betarigs.RentRig(rig.Id, duration, pool)
 	if err != nil {
-		out("ERROR: unable to rent rig", rig.Id, err)
-		chanReply <- true
+		chanFailure <- failure{
+			Rig: &rig,
+			Err: errors.New(fmt.Sprintf("ERROR: unable to rent rig %d %v", rig.Id, err)),
+		}
 		return
 	}
-	//out(resp)
-	// Rental initialized
-	out("New rental", resp.Id, "for rig", rig.Id, "accepted by Betarigs. Rig configuration is done with success.")
-
-	// to avoid Coinbase flooding we will introduce a random sleep (0 to 60 seconds)
-	rand.Seed(time.Now().UnixNano())
-	tts := rand.Intn(60)
-	out("Wait a random delay before paying rental", resp.Id, "to be fair with Coinbase:", tts, "sec")
-	time.Sleep(time.Duration(tts) * time.Second)
-	toSend := &coinbase.SmTransaction{
-		Amount:  strconv.FormatFloat(resp.Payment.Bitcoin.Price.Value, 'f', -1, 64),
-		To:      resp.Payment.Bitcoin.PaymentAddress,
-		UserFee: "0.0002",
-		Idem:    fmt.Sprintf("%d", resp.Id),
-	}
-	r, err := Coinbase.SendMoney(toSend)
-	if err != nil {
-		out("ERROR: unable to send", resp.Payment.Bitcoin.Price.Value, "BTC for rental", resp.Id, ".", err)
-		chanReply <- true
-		return
-	}
-	out(resp.Payment.Bitcoin.Price.Value, "BTC paid to address", resp.Payment.Bitcoin.PaymentAddress, "for rental", resp.Id)
-	// Get tx id and blockchain link
-	time.Sleep(1 * time.Second)
-	details, err := Coinbase.GetTransactionDetails(r.Transaction.Id)
-	if err == nil {
-		out("Check transaction processing for rental", resp.Id, fmt.Sprintf("here https://blockchain.info/tx/%s", details.Hsh))
-	}
-	chanReply <- true
+	chanSuccess <- *resp
+	return
 }
 
 func init() {
@@ -360,6 +340,7 @@ OPTIONS:
 		// Get user BTC balance on coinbase
 		// We check his primary account only
 		btcBalance, err := Coinbase.GetPrimaryAccountBalance()
+		//out(btcBalance)
 		if err != nil {
 			dieError("Fail to get your current coinbase account balance", err)
 		}
@@ -371,21 +352,85 @@ OPTIONS:
 		}
 
 		// The race begin....
-		chanRentReply := make(chan bool)
+		chanDryRun := make(chan bool)
+
+		chanFailure := make(chan failure)
+		chanSuccess := make(chan betarigs.RentalResponse)
+		rentalToPay := []betarigs.RentalResponse{}
 		for _, rig := range rigs {
-			go rentRig(rig, duration, pool, chanRentReply)
+			go rentRig(rig, duration, pool, chanFailure, chanSuccess, chanDryRun)
 		}
 		i := 0
+		failures := 0
+		success := 0
 		for {
 			select {
-			case <-chanRentReply:
-				out("Renting", fmt.Sprintf("%d/%d", i+1, len(rigs)), "completed.")
+			case failure := <-chanFailure:
+				failures++
+				out("Reservation", fmt.Sprintf("%d/%d", i+1, len(rigs)), "of rig", failure.Rig.Id, "failed.", failure.Err)
+			case rentalResp := <-chanSuccess:
+				rentalToPay = append(rentalToPay, rentalResp)
+				success++
+				out("Reservation", fmt.Sprintf("%d/%d", i+1, len(rigs)), "of rig", rentalResp.Rig.Id, "done.")
+			case <-chanDryRun:
+				success++
 			}
 			i++
 			if i >= len(rigs) {
 				break
 			}
 		}
+		// renting done it's time to pay
+		out("All reservations on Betarigs are done. Success:", success, " failures:", failures)
+
+		// All payment must be done in the next 15 minutes
+		timeNow := time.Now()
+	M:
+		for _, resa := range rentalToPay {
+			waitFor := 2 * time.Second
+			if time.Since(timeNow).Minutes() > 15.00 {
+				rentalToPay = append(rentalToPay, resa)
+				break
+			}
+			toSend := &coinbase.SmTransaction{
+				Amount:  strconv.FormatFloat(resa.Payment.Bitcoin.Price.Value, 'f', -1, 64),
+				To:      resa.Payment.Bitcoin.PaymentAddress,
+				UserFee: "0.0002",
+				Idem:    fmt.Sprintf("%d", resa.Id),
+			}
+			var r coinbase.SmMoneyResponse
+			for {
+				if time.Since(timeNow).Minutes() > 15.00 {
+					rentalToPay = append(rentalToPay, resa)
+					break M
+				}
+				r, err := Coinbase.SendMoney(toSend)
+
+				// we have to retry if we have the famous:
+				// You are sending too fast.  Please wait for some transactions to confirm before sending more.
+				// error
+				if r.Success == false && len(r.Errors) > 0 && strings.HasPrefix(r.Errors[0], "You are sending too fast.") {
+					out("Ooops we are sendind to fast. We need to calm down.")
+					time.Sleep(waitFor)
+					if waitFor < 1*time.Minute {
+						waitFor = waitFor * 2
+					}
+					continue
+				}
+				if err != nil {
+					out("ERROR: unable to send", resa.Payment.Bitcoin.Price.Value, "BTC for rental", resa.Id, ".", err)
+				}
+				break
+			}
+			out(resa.Payment.Bitcoin.Price.Value, "BTC paid to address", resa.Payment.Bitcoin.PaymentAddress, "for rental", resa.Id)
+			// Get tx id and blockchain link
+			time.Sleep(1 * time.Second)
+			details, err := Coinbase.GetTransactionDetails(r.Transaction.Id)
+			if err == nil {
+				out("Check transaction processing for rental", resa.Id, fmt.Sprintf("here https://blockchain.info/tx/%s", details.Hsh))
+			}
+		}
+
 		dieOk("All my jobs are done. Bye.")
 	}
 
