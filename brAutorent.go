@@ -71,6 +71,38 @@ func (k *Keyring) Load() {
 	k.brApiKey = string(brApiKey)
 }
 
+// Load ID of blacklisted rigs
+func loadBlacklistedRigs() (blRigs []uint32, err error) {
+	f, err := os.Open(basePath + "/blacklistedRigs.txt")
+	if err != nil {
+		log.Println("No blacklistedRigs.txt found. Type --help if you want to know more about rigs blacklist.")
+		err = nil
+		return
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	for {
+		line, _, err := r.ReadLine()
+
+		if err != nil {
+			if err.Error() == "EOF" {
+				break
+			}
+			log.Fatalln("Error reading blacklistedRigs.txt.", err)
+		}
+		// comment
+		if line[0] == 35 {
+			continue
+		}
+		rigId, err := strconv.ParseUint(strings.TrimSpace(string(line)), 10, 32)
+		if err != nil {
+			log.Fatalln("Error reading blacklistedRigs.txt.", err)
+		}
+		blRigs = append(blRigs, uint32(rigId))
+	}
+	return
+}
+
 // dieError exit displaying an error message
 func dieError(msg ...interface{}) {
 	m := "ERROR: "
@@ -149,6 +181,12 @@ func findMatchingRigs(algo string, duration int, mhs, maxprice float64) (rigs []
 	page := 0
 	totalSpeed = 0.00
 	totalPrice = 0.00
+
+	// Load blacklist
+	blacklistedRigs, err := loadBlacklistedRigs()
+	if err != nil {
+		log.Fatalln("Unable to get blacklisted rigs.", err)
+	}
 L:
 	for {
 		page++
@@ -161,6 +199,17 @@ L:
 		}
 
 		for _, r := range avRigs {
+			blacklisted := false
+			for _, blr := range blacklistedRigs {
+				if blr == r.Id {
+					blacklisted = true
+				}
+			}
+			if blacklisted {
+				log.Println(fmt.Sprintf("Ring %d is blacklisted. Skipped.", r.Id))
+				continue
+			}
+
 			// Duration
 			if !durationIsAvailable(&r, duration) {
 				continue
@@ -246,10 +295,13 @@ USAGE:
 
    Before using {{.Name}} you need to add, in the same folder as this app, a text file 
    named keyring.txt whith:
-   On the first line: 	Your coinbase API key
-   On the second line: 	Your coinbase API secret
-   On the third line : 	Your betarigs API key
+   	On the first line: 		Your coinbase API key
+   	On the second line: 	Your coinbase API secret
+   	On the third line : 	Your betarigs API key
 
+   Rig blacklist: 
+   	If there some rigs that you doesn't want to rent just add a text file named "blacklistedRigs.txt" in the same folder as the app and put ids of the rigs you want to blacklist, ONE PER LINE.
+   	Lines beginning by # are traited as comment.	
 
 OPTIONS:
    {{range .Flags}}{{.}}
@@ -257,14 +309,14 @@ OPTIONS:
 `
 
 	app.Flags = []cli.Flag{
-		cli.StringFlag{"algo", "", "Mining algorithm (scrypt or x11 or x13 or x15 or sha256 or blake256 or scrypt-n or keccak). Required."},
-		cli.Float64Flag{"mhs", 0.00, "Max mining power to rent in Mh/s. Float. Required."},
-		cli.IntFlag{"duration", 0, "A given mining duration in hours. Integer. Required."},
-		cli.Float64Flag{"maxprice", 0.00, "The maximum price in BTC/Mh/day of the rigs to rent. Float. Required."},
-		cli.StringFlag{"poolurl", "", "The pool url formated using host:port, example stratum1.suchpool.pw:3335. Required."},
-		cli.StringFlag{"wname", "", "The pool worker name. Required."},
-		cli.StringFlag{"wpassword", "", "The pool worker password. Required."},
-		cli.BoolFlag{"dryrun", `If this flag is set, brAutorent will simulate the rental creation and payment.`},
+		cli.StringFlag{"algo", "", "Mining algorithm (scrypt or x11 or x13 or x15 or sha256 or blake256 or scrypt-n or keccak). Required.", ""},
+		cli.Float64Flag{"mhs", 0.00, "Max mining power to rent in Mh/s. Float. Required.", ""},
+		cli.IntFlag{"duration", 0, "A given mining duration in hours. Integer. Required.", ""},
+		cli.Float64Flag{"maxprice", 0.00, "The maximum price in BTC/Mh/day of the rigs to rent. Float. Required.", ""},
+		cli.StringFlag{"poolurl", "", "The pool url formated using host:port, example stratum1.suchpool.pw:3335. Required.", ""},
+		cli.StringFlag{"wname", "", "The pool worker name. Required.", ""},
+		cli.StringFlag{"wpassword", "", "The pool worker password. Required.", ""},
+		cli.BoolFlag{"dryrun", `If this flag is set, brAutorent will simulate the rental creation and payment.`, ""},
 	}
 
 	app.Action = func(c *cli.Context) {
