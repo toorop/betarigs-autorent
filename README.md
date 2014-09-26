@@ -42,6 +42,10 @@ On windows you should replace "-o brAutorent" by "-o brAutorent.exe"
    	On the second line: 	Your coinbase API secret
    	On the third line : 	Your betarigs API key
 
+      Rig blacklist:
+      If there some rigs that you doesn't want to rent just add a text file named "blacklistedRigs.txt" in the same folder as the app and put ids of the rigs you want to blacklist, ONE PER LINE.
+      Lines beginning by # are traited as comment.
+
 
 	OPTIONS:
    	--algo 		Mining algorithm (scrypt or x11 or x13 or x15 or sha256 or blake256 or scrypt-n or keccak). Required.
